@@ -111,7 +111,7 @@ function AclForm(props: {
           >
             {(key, index) => (
               <div
-                class="col-span-1 ml-1 text-sm [writing-mode:vertical-rl]"
+                class="col-span-1 text-sm [writing-mode:vertical-lr]"
                 style={{ "grid-column-start": index() + 2 }}
               >
                 {key}
@@ -346,7 +346,7 @@ function siteUrl(config: Config | undefined): string {
 }
 
 function CodeBlock(props: { text: string }) {
-  return <pre class="text-wrap break-all font-mono text-sm">{props.text}</pre>;
+  return <pre class="font-mono text-sm text-wrap break-all">{props.text}</pre>;
 }
 
 function ReadExample(props: { apiName: string; config: Config | undefined }) {

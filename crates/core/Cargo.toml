@@ -16,13 +16,17 @@ exclude = [
 ]
 autobenches = false
 
+[lib]
+doctest = false
+
 [[bench]]
 name = "benchmark"
 harness = false
 
 [features]
-default = ["v8"]
+default = ["v8", "wasm"]
 v8 = ["dep:trailbase-js"]
+wasm = ["dep:trailbase-wasm-runtime-host"]
 
 [dependencies]
 aes-gcm = { version = "0.10.3", default-features = false, features = ["aes", "alloc", "getrandom", "rand_core"] }
@@ -52,17 +56,17 @@ lazy_static = "1.4.0"
 lettre = { version = "^0.11.7", default-features = false, features = ["tokio1-rustls-tls", "sendmail-transport", "smtp-transport", "builder"] }
 log = { version = "^0.4.21", default-features = false }
 mini-moka = "0.10.3"
-minijinja = { version = "2.1.2", default-features = false }
+minijinja = { workspace = true }
 oauth2 = { version = "5.0.0-alpha.4", default-features = false, features = ["reqwest", "rustls-tls"] }
 object_store = { version = "0.12.0", default-features = false, features = ["aws", "fs"] }
 parking_lot = { workspace = true }
 pin-project-lite = "0.2.16"
 prost = { version = "^0.14.1", default-features = false }
 prost-reflect = { version = "^0.16.0", default-features = false, features = ["derive", "text-format"] }
-rand = "^0.9.0"
+rand = { workspace = true }
 reactivate = { version = "0.4.2", features = ["threadsafe"] }
 regex = "1.11.0"
-reqwest = { version = "0.12.8", default-features = false, features = ["rustls-tls", "json"] }
+reqwest = { workspace = true }
 rusqlite = { workspace = true }
 rust-embed = { workspace = true }
 serde = { version = "^1.0.203", features = ["derive"] }
@@ -70,7 +74,7 @@ serde_json = "^1.0.117"
 serde_path_to_error = "0.1.16"
 serde_urlencoded = "0.7.1"
 sha2 = "0.10.8"
-sqlformat = "0.3.1"
+sqlformat = "0.4.0"
 sqlite3-parser = "0.15.0"
 thiserror = "2.0.12"
 tokio = { workspace = true }
@@ -89,13 +93,14 @@ trailbase-qs = { workspace = true }
 trailbase-refinery = { workspace = true }
 trailbase-schema = { workspace = true }
 trailbase-sqlite = { workspace = true }
-trailbase-wasm-runtime-host = { workspace = true }
+trailbase-wasm-runtime-host = { workspace = true, optional = true }
 trailbase-wasm-common = { workspace = true }
 ts-rs = { workspace = true }
 url = { version = "^2.4.1", default-features = false }
 utoipa = { version = "5.0.0-beta.0", features = ["axum_extras"] }
 uuid = { workspace = true }
 validator = { version = "0.20.0", default-features = false }
+indexmap = "2.11.4"
 
 [build-dependencies]
 trailbase-build = { workspace = true }

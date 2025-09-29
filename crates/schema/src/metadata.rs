@@ -24,6 +24,8 @@ pub enum JsonSchemaError {
   NotFound(String),
   #[error("Json serialization error: {0}")]
   JsonSerialization(Arc<serde_json::Error>),
+  #[error("Other: {0}")]
+  Other(String),
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -428,13 +430,11 @@ pub fn find_user_id_foreign_key_columns(columns: &[Column], user_table_name: &st
         referred_columns,
         ..
       } = opt
+        && foreign_table == user_table_name
+        && referred_columns.len() == 1
+        && referred_columns[0] == "id"
       {
-        if foreign_table == user_table_name
-          && referred_columns.len() == 1
-          && referred_columns[0] == "id"
-        {
-          indexes.push(index);
-        }
+        indexes.push(index);
       }
     }
   }

@@ -26,7 +26,7 @@ use wasmtime_wasi_http::bindings::http::types::ErrorCode;
 use wasmtime_wasi_http::{WasiHttpCtx, WasiHttpView};
 use wasmtime_wasi_io::IoView;
 
-use crate::exports::trailbase::runtime::init_endpoint::InitResult;
+use crate::exports::trailbase::runtime::init_endpoint::{InitArguments, InitResult};
 
 pub use trailbase_wasi_keyvalue::Store as KvStore;
 
@@ -362,6 +362,9 @@ impl trailbase::runtime::host_endpoint::Host for State {
 }
 
 pub struct Runtime {
+  /// Path to original .wasm component file.
+  pub component_path: std::path::PathBuf,
+
   // Shared sender.
   shared_sender: kanal::AsyncSender<Message>,
   threads: Vec<(std::thread::JoinHandle<()>, kanal::AsyncSender<Message>)>,
@@ -397,13 +400,21 @@ fn build_config(cache: Option<wasmtime::Cache>) -> Config {
   return config;
 }
 
+#[derive(Clone, Default, Debug)]
+pub struct RuntimeOptions {
+  /// Number of threads the runtime will schedule on.
+  pub n_threads: Option<usize>,
+
+  /// Optional file-system sandbox root for r/o file access.
+  pub fs_root_path: Option<std::path::PathBuf>,
+}
+
 impl Runtime {
   pub fn new(
-    n_threads: usize,
     wasm_source_file: std::path::PathBuf,
     conn: trailbase_sqlite::Connection,
     kv_store: KvStore,
-    fs_root_path: Option<std::path::PathBuf>,
+    opts: RuntimeOptions,
   ) -> Result<Self, Error> {
     let engine = Engine::new(&build_config(Some(wasmtime::Cache::new(
       wasmtime::CacheConfig::default(),
@@ -448,6 +459,11 @@ impl Runtime {
       linker
     };
 
+    let n_threads = opts
+      .n_threads
+      .or(std::thread::available_parallelism().ok().map(|n| n.get()))
+      .unwrap_or(1);
+
     log::info!("Starting WASM runtime with {n_threads} threads.");
 
     let (shared_sender, shared_receiver) = kanal::unbounded_async::<Message>();
@@ -463,7 +479,7 @@ impl Runtime {
 
         let conn = conn.clone();
         let kv_store = kv_store.clone();
-        let fs_root_path = fs_root_path.clone();
+        let fs_root_path = opts.fs_root_path.clone();
 
         let handle = std::thread::Builder::new()
           .name(format!("wasm-runtime-{index}"))
@@ -500,6 +516,7 @@ impl Runtime {
       .collect::<Result<Vec<_>, Error>>()?;
 
     return Ok(Self {
+      component_path: wasm_source_file,
       shared_sender,
       threads,
     });
@@ -597,38 +614,11 @@ pub struct RuntimeInstance {
   shared: Arc<SharedState>,
 }
 
-impl RuntimeInstance {
-  // pub fn new(
-  //   engine: Engine,
-  //   component: Component,
-  //   linker: Linker<State>,
-  //   shared_state: SharedState,
-  // ) -> Result<Self, Error> {
-  //   // let mut linker = Linker::<State>::new(&engine);
-  //   //
-  //   // // Adds all the default WASI implementations: clocks, random, fs, ...
-  //   // add_to_linker_async(&mut linker)?;
-  //   //
-  //   // // Adds default HTTP interfaces - incoming and outgoing.
-  //   // wasmtime_wasi_http::add_only_http_to_linker_async(&mut linker)?;
-  //   //
-  //   // // Add default KV interfaces.
-  //   // trailbase_wasi_keyvalue::add_to_linker(&mut linker, |cx| {
-  //   //   trailbase_wasi_keyvalue::WasiKeyValue::new(&cx.kv, &mut cx.resource_table)
-  //   // })?;
-  //   //
-  //   // // Host interfaces.
-  //   // trailbase::runtime::host_endpoint::add_to_linker::<_, HasSelf<State>>(&mut linker, |s|
-  // s)?;
-  //
-  //   return Ok(Self {
-  //     engine,
-  //     component,
-  //     linker,
-  //     shared: Arc::new(shared_state),
-  //   });
-  // }
+pub struct InitArgs {
+  pub version: Option<String>,
+}
 
+impl RuntimeInstance {
   fn new_store(&self) -> Result<Store<State>, Error> {
     let mut wasi_ctx = WasiCtxBuilder::new();
     wasi_ctx.inherit_stdio();
@@ -660,14 +650,19 @@ impl RuntimeInstance {
     ));
   }
 
-  pub async fn call_init(&self) -> Result<InitResult, Error> {
+  pub async fn call_init(&self, args: InitArgs) -> Result<InitResult, Error> {
     let mut store = self.new_store()?;
     let bindings = Trailbase::instantiate_async(&mut store, &self.component, &self.linker).await?;
 
     return Ok(
       bindings
         .trailbase_runtime_init_endpoint()
-        .call_init(&mut store)
+        .call_init(
+          &mut store,
+          &InitArguments {
+            version: args.version,
+          },
+        )
         .await?,
     );
   }
@@ -790,17 +785,22 @@ mod tests {
     let conn = trailbase_sqlite::Connection::open_in_memory().unwrap();
     let kv_store = KvStore::new();
     let runtime = Runtime::new(
-      2,
       "../../client/testfixture/wasm/wasm_rust_guest_testfixture.wasm".into(),
       conn.clone(),
       kv_store,
-      None,
+      RuntimeOptions {
+        n_threads: Some(2),
+        ..Default::default()
+      },
     )
     .unwrap();
 
     runtime
       .call(async |instance| {
-        instance.call_init().await.unwrap();
+        instance
+          .call_init(InitArgs { version: None })
+          .await
+          .unwrap();
       })
       .await
       .unwrap();
@@ -831,11 +831,13 @@ mod tests {
     let kv_store = KvStore::new();
     let runtime = Arc::new(
       Runtime::new(
-        2,
         "../../client/testfixture/wasm/wasm_rust_guest_testfixture.wasm".into(),
         conn.clone(),
         kv_store,
-        None,
+        RuntimeOptions {
+          n_threads: Some(2),
+          ..Default::default()
+        },
       )
       .unwrap(),
     );

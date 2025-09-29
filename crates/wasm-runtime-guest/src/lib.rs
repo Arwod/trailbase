@@ -41,12 +41,12 @@ use wstd::http::server::{Finished, Responder};
 use crate::http::{HttpRoute, Method, StatusCode, empty_error_response};
 use crate::job::Job;
 
+pub use crate::wit::exports::trailbase::runtime::init_endpoint::{InitArguments, InitResult};
+pub use crate::wit::trailbase::runtime::host_endpoint::thread_id;
+
 // Needed for export macro
 pub use static_assertions::assert_impl_all;
-pub use wstd::wasi;
-
-pub use crate::wit::exports::trailbase::runtime::init_endpoint::InitResult;
-pub use crate::wit::trailbase::runtime::host_endpoint::thread_id;
+pub use wstd::wasip2 as __wasi;
 
 #[macro_export]
 macro_rules! export {
@@ -56,12 +56,19 @@ macro_rules! export {
         ::trailbase_wasm::wit::export!($impl);
         // Register Incoming HTTP handler.
         type _HttpHandlerIdent = ::trailbase_wasm::HttpIncomingHandler<$impl>;
-        ::trailbase_wasm::wasi::http::proxy::export!(
-            _HttpHandlerIdent with_types_in ::trailbase_wasm::wasi);
+        ::trailbase_wasm::__wasi::http::proxy::export!(
+            _HttpHandlerIdent with_types_in ::trailbase_wasm::__wasi);
     };
 }
 
+#[derive(Debug)]
+pub struct Args {
+  pub version: Option<String>,
+}
+
 pub trait Guest {
+  fn init(_: Args) {}
+
   fn http_handlers() -> Vec<HttpRoute> {
     return vec![];
   }
@@ -72,7 +79,11 @@ pub trait Guest {
 }
 
 impl<T: Guest> crate::wit::exports::trailbase::runtime::init_endpoint::Guest for T {
-  fn init() -> InitResult {
+  fn init(args: InitArguments) -> InitResult {
+    T::init(Args {
+      version: args.version,
+    });
+
     return InitResult {
       http_handlers: T::http_handlers()
         .into_iter()
@@ -132,10 +143,10 @@ impl<T: Guest> HttpIncomingHandler<T> {
   }
 }
 
-impl<T: Guest> ::wstd::wasi::exports::http::incoming_handler::Guest for HttpIncomingHandler<T> {
+impl<T: Guest> ::wstd::wasip2::exports::http::incoming_handler::Guest for HttpIncomingHandler<T> {
   fn handle(
-    request: ::wstd::wasi::http::types::IncomingRequest,
-    response_out: ::wstd::wasi::http::types::ResponseOutparam,
+    request: ::wstd::wasip2::http::types::IncomingRequest,
+    response_out: ::wstd::wasip2::http::types::ResponseOutparam,
   ) {
     let responder = Responder::new(response_out);
 

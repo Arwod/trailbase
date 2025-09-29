@@ -1,11 +1,24 @@
 use askama::Template;
 use askama::filters::Safe;
 use itertools::Itertools;
+use rust_embed::RustEmbed;
+use serde::Deserialize;
 
+#[derive(RustEmbed, Clone)]
+#[folder = "ui/dist/"]
+pub struct AuthAssets;
+
+#[derive(Deserialize)]
 pub struct OAuthProvider {
   pub name: String,
   pub display_name: String,
   pub img_name: String,
+}
+
+#[derive(Deserialize)]
+pub struct AuthConfig {
+  pub disable_password_auth: bool,
+  pub oauth_providers: Vec<OAuthProvider>,
 }
 
 /// Render a slice of tuples into an unescpaed query string.

@@ -1,6 +1,8 @@
+use base64::prelude::*;
 use futures_lite::StreamExt;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
+use temp_dir::TempDir;
 use trailbase_client::{
   Client, CompareOp, DbEvent, Filter, ListArguments, ListResponse, Pagination, ReadArguments,
 };
@@ -390,6 +392,194 @@ async fn subscription_test() {
   }
 }
 
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct FileUpload {
+  /// The file's UUID, should be stripped.
+  id: Option<String>,
+
+  /// The file's original filename
+  original_filename: Option<String>,
+
+  /// The file's unique filename.
+  filename: Option<String>,
+
+  /// The file's user-provided content type.
+  content_type: Option<String>,
+
+  /// The file's inferred mime type. Not user provided.
+  mime_type: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct FileUploadTable {
+  name: Option<String>,
+  single_file: Option<FileUpload>,
+  multiple_files: Vec<FileUpload>,
+}
+
+async fn file_upload_json_base64_test() {
+  let client = connect().await;
+  let api = client.records("file_upload_table");
+
+  let test_bytes1 = vec![0, 1, 2, 3, 4, 5];
+  let test_bytes2 = vec![42, 5, 42, 5];
+  let test_bytes3 = vec![255, 128, 64, 32];
+
+  // Test creating a record with multiple base64 encoded files
+  let record_id = api
+    .create(json!({
+      "name": "Base64 File Upload Test",
+      "single_file": {
+        "name": "single_test",
+        "filename": "test1.bin",
+        "content_type": "application/octet-stream",
+        "data": BASE64_URL_SAFE.encode(&test_bytes1)
+      },
+      "multiple_files": [
+        {
+          "name": "multi_test_1",
+          "filename": "test2.bin",
+          "content_type": "application/octet-stream",
+          "data": BASE64_URL_SAFE.encode(&test_bytes2)
+        },
+        {
+          "name": "multi_test_2",
+          "filename": "test3.bin",
+          "content_type": "application/octet-stream",
+          "data": BASE64_STANDARD.encode(&test_bytes3)
+        }
+      ]
+    }))
+    .await
+    .unwrap();
+
+  // Read the record back to verify file metadata was stored correctly
+  let record: FileUploadTable = api.read(&record_id).await.unwrap();
+
+  // Verify single file metadata
+  let single_file = record.single_file.as_ref().unwrap();
+  assert_eq!(None, single_file.id);
+  assert_eq!(single_file.original_filename.as_deref(), Some("test1.bin"));
+  assert_eq!(
+    single_file.content_type.as_deref(),
+    Some("application/octet-stream")
+  );
+
+  // Verify multiple files metadata
+  let multiple_files = &record.multiple_files;
+  assert_eq!(multiple_files.len(), 2);
+  assert_eq!(
+    multiple_files[0].original_filename.as_deref(),
+    Some("test2.bin")
+  );
+  assert_eq!(
+    multiple_files[1].original_filename.as_deref(),
+    Some("test3.bin")
+  );
+
+  let http_client = reqwest::Client::new();
+
+  // Test file download endpoints to verify actual file content
+  let single_file_fname = single_file.filename.as_deref().unwrap();
+  for single_file_url in [
+    format!(
+      "http://127.0.0.1:{PORT}/api/records/v1/file_upload_table/{record_id}/file/single_file"
+    ),
+    format!(
+      "http://127.0.0.1:{PORT}/api/records/v1/file_upload_table/{record_id}/files/single_file/{single_file_fname}"
+    ),
+  ] {
+    let single_file_response = http_client.get(&single_file_url).send().await.unwrap();
+    let single_file_bytes = single_file_response.bytes().await.unwrap();
+    assert_eq!(
+      single_file_bytes.to_vec(),
+      test_bytes1,
+      "{}",
+      String::from_utf8_lossy(&single_file_bytes)
+    );
+  }
+
+  let multi_file_1_response = http_client
+    .get(&format!(
+      "http://127.0.0.1:{PORT}/api/records/v1/file_upload_table/{record_id}/files/multiple_files/0",
+    ))
+    .send()
+    .await
+    .unwrap();
+  let multi_file_1_bytes = multi_file_1_response.bytes().await.unwrap();
+  assert_eq!(multi_file_1_bytes, test_bytes2);
+
+  let filename = multiple_files[1].filename.as_ref().unwrap();
+  let multi_file_2_response = http_client
+    .get(&format!(
+      "http://127.0.0.1:{PORT}/api/records/v1/file_upload_table/{record_id}/files/multiple_files/{filename}"
+    ))
+    .send()
+    .await
+    .unwrap();
+
+  assert!(
+    multi_file_2_response.status().is_success(),
+    "{:?}",
+    multi_file_2_response.text().await
+  );
+  let multi_file_2_bytes = multi_file_2_response.bytes().await.unwrap();
+
+  assert_eq!(multi_file_2_bytes, test_bytes3,);
+
+  // Clean up
+  api.delete(&record_id).await.unwrap();
+}
+
+async fn file_upload_multipart_form_test() {
+  let d = TempDir::new().unwrap();
+  let f = d.child("test.text");
+  let contents = b"contents";
+  std::fs::write(&f, contents).unwrap();
+
+  let client = connect().await;
+  let api = client.records("file_upload_table");
+  let http_client = reqwest::Client::new();
+  let form = reqwest::multipart::Form::new()
+    .text("name", "Base64 Multipart-Form Test")
+    .file("single_file", f.as_path())
+    .await
+    .unwrap();
+
+  #[derive(Deserialize)]
+  pub struct RecordIdResponse {
+    pub ids: Vec<String>,
+  }
+
+  let response: RecordIdResponse = http_client
+    .post(&format!(
+      "http://127.0.0.1:{PORT}/api/records/v1/file_upload_table"
+    ))
+    .multipart(form)
+    .send()
+    .await
+    .unwrap()
+    .json()
+    .await
+    .unwrap();
+
+  let record_id = &response.ids[0];
+
+  let single_file_response = http_client
+    .get(&format!(
+      "http://127.0.0.1:{PORT}/api/records/v1/file_upload_table/{record_id}/file/single_file",
+    ))
+    .send()
+    .await
+    .unwrap();
+
+  let single_file_bytes = single_file_response.bytes().await.unwrap();
+  assert_eq!(single_file_bytes.to_vec(), contents);
+
+  // Clean up
+  api.delete(record_id).await.unwrap();
+}
+
 #[test]
 fn integration_test() {
   let _server = start_server().unwrap();
@@ -410,6 +600,12 @@ fn integration_test() {
 
   runtime.block_on(subscription_test());
   println!("Ran subscription tests");
+
+  runtime.block_on(file_upload_json_base64_test());
+  println!("Ran file upload JSON base64 tests");
+
+  runtime.block_on(file_upload_multipart_form_test());
+  println!("Ran file upload multipart form tests");
 }
 
 fn now() -> u64 {

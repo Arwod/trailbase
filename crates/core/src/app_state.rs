@@ -1,10 +1,11 @@
 use log::*;
 use object_store::ObjectStore;
 use reactivate::{Merge, Reactive};
+use serde::Serialize;
 use std::path::PathBuf;
 use std::sync::Arc;
+use tokio::sync::RwLock;
 use trailbase_schema::QualifiedName;
-use trailbase_wasm_runtime_host::Runtime;
 
 use crate::auth::jwt::JwtHelper;
 use crate::auth::options::AuthOptions;
@@ -17,6 +18,7 @@ use crate::records::RecordApi;
 use crate::records::subscribe::SubscriptionManager;
 use crate::scheduler::{JobRegistry, build_job_registry_from_config};
 use crate::schema_metadata::SchemaMetadataCache;
+use crate::wasm::Runtime;
 
 /// The app's internal state. AppState needs to be clonable which puts unnecessary constraints on
 /// the internals. Thus rather arc once than many times.
@@ -44,11 +46,12 @@ struct InternalState {
 
   runtime: RuntimeHandle,
 
-  wasm_runtimes: Vec<Arc<Runtime>>,
+  wasm_runtimes: Vec<Arc<RwLock<Runtime>>>,
+  build_wasm_runtimes: Box<dyn Fn() -> Result<Vec<Runtime>, crate::wasm::AnyError> + Send + Sync>,
 
   #[cfg(test)]
   #[allow(unused)]
-  cleanup: Vec<Box<dyn std::any::Any + Send + Sync>>,
+  test_cleanup: Vec<Box<dyn std::any::Any + Send + Sync>>,
 }
 
 pub(crate) struct AppStateArgs {
@@ -129,13 +132,44 @@ impl AppState {
     );
 
     let runtime = build_js_runtime(args.conn.clone(), args.runtime_threads);
-    let wasm_runtimes = crate::wasm::build_wasm_runtimes_for_components(
-      args.runtime_threads,
-      args.conn.clone(),
-      args.data_dir.root().join("wasm"),
-      args.runtime_root_fs,
-    )
-    .expect("startup");
+
+    let shared_kv_store = {
+      let shared_kv_store = crate::wasm::KvStore::new();
+
+      // Assign right away.
+      config.with_value(|c| {
+        shared_kv_store.set(
+          AUTH_CONFIG_KEY.to_string(),
+          serde_json::to_vec(&build_auth_config(c)).expect("startup"),
+        );
+      });
+
+      // Register an observer for continuous updates.
+      {
+        let shared_kv_store = shared_kv_store.clone();
+        config.add_observer(move |c| {
+          if let Ok(v) = serde_json::to_vec(&build_auth_config(c)) {
+            shared_kv_store.set(AUTH_CONFIG_KEY.to_string(), v);
+          }
+        });
+      }
+
+      shared_kv_store
+    };
+
+    let build_wasm_runtimes = {
+      let conn = args.conn.clone();
+      let wasm_dir = args.data_dir.root().join("wasm");
+      move || {
+        return crate::wasm::build_wasm_runtimes_for_components(
+          args.runtime_threads,
+          conn.clone(),
+          shared_kv_store.clone(),
+          wasm_dir.clone(),
+          args.runtime_root_fs.clone(),
+        );
+      }
+    };
 
     AppState {
       state: Arc::new(InternalState {
@@ -174,9 +208,14 @@ impl AppState {
         schema_metadata,
         object_store,
         runtime,
-        wasm_runtimes,
+        wasm_runtimes: build_wasm_runtimes()
+          .expect("startup")
+          .into_iter()
+          .map(|rt| Arc::new(RwLock::new(rt)))
+          .collect(),
+        build_wasm_runtimes: Box::new(build_wasm_runtimes),
         #[cfg(test)]
-        cleanup: vec![],
+        test_cleanup: vec![],
       }),
     }
   }
@@ -324,8 +363,43 @@ impl AppState {
     return self.state.runtime.clone();
   }
 
-  pub(crate) fn wasm_runtimes(&self) -> &[Arc<Runtime>] {
+  pub(crate) fn wasm_runtimes(&self) -> &[Arc<RwLock<Runtime>>] {
     return &self.state.wasm_runtimes;
+  }
+
+  pub(crate) async fn reload_wasm_runtimes(&self) -> Result<(), crate::wasm::AnyError> {
+    let mut new_runtimes = (self.state.build_wasm_runtimes)()?;
+    if new_runtimes.is_empty() {
+      return Ok(());
+    }
+
+    // TODO: Differentiate between an actual rebuild vs a cached re-build to warn users
+    // about routes not being able to be changed.
+    info!("Reloading WASM components. New HTTP routes and Jobs require a server restart.");
+
+    for old_rt in &self.state.wasm_runtimes {
+      let component_path = old_rt.read().await.component_path.clone();
+
+      let Some(index) = new_runtimes
+        .iter()
+        .position(|rt| rt.component_path == component_path)
+      else {
+        warn!("WASM component: {component_path:?} was removed. Required server restart");
+        continue;
+      };
+
+      // Swap out old with new WASM runtime for the given component.
+      *old_rt.write().await = new_runtimes.remove(index);
+    }
+
+    for new_rt in new_runtimes {
+      warn!(
+        "New WASM component found {:?}. Requires server restart.",
+        new_rt.component_path
+      );
+    }
+
+    return Ok(());
   }
 }
 
@@ -475,7 +549,8 @@ pub async fn test_state(options: Option<TestStateOptions>) -> anyhow::Result<App
       object_store,
       runtime: build_js_runtime(conn, None),
       wasm_runtimes: vec![],
-      cleanup: vec![Box::new(temp_dir)],
+      build_wasm_runtimes: Box::new(|| Ok(vec![])),
+      test_cleanup: vec![Box::new(temp_dir)],
     }),
   });
 }
@@ -588,3 +663,44 @@ fn build_site_url(c: &Config) -> Result<Option<url::Url>, url::ParseError> {
 
   return Ok(None);
 }
+
+#[derive(Serialize)]
+pub struct OAuthProvider {
+  pub name: String,
+  pub display_name: String,
+  pub img_name: String,
+}
+
+#[derive(Serialize)]
+struct AuthConfig {
+  disable_password_auth: bool,
+  oauth_providers: Vec<OAuthProvider>,
+}
+
+fn build_auth_config(config: &Config) -> AuthConfig {
+  let oauth_providers: Vec<_> = config
+    .auth
+    .oauth_providers
+    .iter()
+    .filter_map(|(key, config)| {
+      let entry = crate::auth::oauth::providers::oauth_provider_registry
+        .iter()
+        .find(|registered| config.provider_id == Some(registered.id as i32))?;
+
+      let provider = (entry.factory)(key, config).ok()?;
+      let name = provider.name();
+      return Some(OAuthProvider {
+        name: name.to_string(),
+        display_name: provider.display_name().to_string(),
+        img_name: crate::auth::util::oauth_provider_name_to_img(name),
+      });
+    })
+    .collect();
+
+  return AuthConfig {
+    disable_password_auth: config.auth.disable_password_auth(),
+    oauth_providers,
+  };
+}
+
+const AUTH_CONFIG_KEY: &str = "config:auth";
